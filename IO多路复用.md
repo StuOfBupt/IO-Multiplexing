@@ -314,3 +314,212 @@ int main() {
 }
 ```
 
+## 5. epoll 在 Redis 中的应用
+
+redis相关的面试题都会有这样几个问题：
+
+> 1. 简单说一下redis的单线程模型
+> 2. 为什么redis使用单线程却有非常高效的性能
+
+​		回顾上面关于epoll的讨论，讲到epoll是I/O多路复用模型的一种实现，而多路复用的核心就是多个网络连接复用一个线程。**redis的默认的网络模型是基于epoll实现的**，这解答了第一个问题，因为epoll是一个单线程模型。
+
+​		redis的高效也可以用epoll的高效来解释，**即使建立了数以万计的连接，但是同一时刻处于就绪状态的往往并不是很多，epoll_wait()内部仅通过监听一个就绪链表来决定函数是否返回，而不像select()那样轮询监听的每一个连接**（但是redis也可以选择使用select()的方式运行），下面通过部分redis的源码来看看redis是如何使用epoll的。
+
+> ```shell
+> 源码地址
+> wget http://download.redis.io/releases/redis-6.0.7.tar.gz
+> tar -zxvf redis-6.0.7.tar.gz
+> cd redis-6.0.7/src
+> ```
+
+1. 先看redis服务初始化的地方server.c，initServer()内部通过调用aeCreateEventLoop()函数来创建epoll对象
+
+   ```c
+   void initServer(void) {
+       // ......
+     	// 创建 epoll 对象，设置最大连接数
+       server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
+       if (server.el == NULL) {
+           serverLog(LL_WARNING,
+               "Failed creating the event loop. Error message: '%s'",
+               strerror(errno));
+           exit(1);
+       }
+       // ......
+   }
+   ```
+
+   
+
+2. 进到aeCreateEventLoop()方法内部，redis定义了aeEventLoop结构体来保存待处理**文件事件**和**时间事件**，和大量事件执行的上下文信息，aeEventLoop可以参考下这篇文章[Redis中的事件循环](https://draveness.me/redis-eventloop/)，这里需要关注的是`void *apidata`，它被用来存放polling API 相关的数据(刚才说到redis支持epoll/select/evport/kqueue这几种polling API)，下面这张图可以看出aeApiCreate()在不同polling API下有不同的实现，下面我们就进入epoll的aeApiCreate()看看。
+
+   ```c
+   /* State of an event based program */
+   typedef struct aeEventLoop {
+       int maxfd;   /* highest file descriptor currently registered */
+       int setsize; /* max number of file descriptors tracked */
+       long long timeEventNextId;
+       time_t lastTime;     /* Used to detect system clock skew */
+       aeFileEvent *events; /* Registered events */
+       aeFiredEvent *fired; /* Fired events */
+       aeTimeEvent *timeEventHead;
+       int stop;
+       void *apidata; /* This is used for polling API specific data */
+       aeBeforeSleepProc *beforesleep;
+       aeBeforeSleepProc *aftersleep;
+       int flags;
+   } aeEventLoop;
+   
+   
+   aeEventLoop *aeCreateEventLoop(int setsize) {
+       aeEventLoop *eventLoop;
+       int i;
+       ......
+       if (aeApiCreate(eventLoop) == -1) goto err;
+       ......
+   err:
+       if (eventLoop) {
+           zfree(eventLoop->events);
+           zfree(eventLoop->fired);
+           zfree(eventLoop);
+       }
+       return NULL;
+   }
+   ```
+
+3. 来到ae_epoll.c的aeApiCreate()方法内部，redis定义了aeApiState结构体，用来保存初始化epoll时得到的文件描述符和epoll_event。aeApiCreate()方法初始化了epoll_event，并调用epoll_create()创建了epoll对象，将得到的epoll文件描述符保存到aeApiState.epfd中。
+
+   ```c
+   typedef struct aeApiState {
+       int epfd;
+       struct epoll_event *events;
+   } aeApiState;
+   
+   
+   static int aeApiCreate(aeEventLoop *eventLoop) {
+       aeApiState *state = zmalloc(sizeof(aeApiState));
+   
+       if (!state) return -1;
+       state->events = zmalloc(sizeof(struct epoll_event)*eventLoop->setsize);
+       if (!state->events) {
+           zfree(state);
+           return -1;
+       }
+       state->epfd = epoll_create(1024); /* 1024 is just a hint for the kernel */
+       if (state->epfd == -1) {
+           zfree(state->events);
+           zfree(state);
+           return -1;
+       }
+       eventLoop->apidata = state;
+       return 0;
+   }
+   ```
+
+4. 回到initServer()，完成epoll_create()后，redis server开始监听对应的端口，这里通过anetNonBlock(NULL,server.sofd)将socket设置为非阻塞模式。
+
+   ```c
+   void initServer(void) {
+   /*创建epoll*/
+       ......
+   /* Open the TCP listening socket for the user commands. */
+       if (server.port != 0 &&
+           listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
+           exit(1);
+       if (server.tls_port != 0 &&
+           listenToPort(server.tls_port,server.tlsfd,&server.tlsfd_count) == C_ERR)
+           exit(1);
+   
+   
+   /* Open the listening Unix domain socket. */
+       if (server.unixsocket != NULL) {
+           unlink(server.unixsocket); /* don't care if this fails */
+           server.sofd = anetUnixServer(server.neterr,server.unixsocket,
+               server.unixsocketperm, server.tcp_backlog);
+           if (server.sofd == ANET_ERR) {
+               serverLog(LL_WARNING, "Opening Unix socket: %s", server.neterr);
+               exit(1);
+           }
+           anetNonBlock(NULL,server.sofd);
+       }
+   }
+   ```
+
+5. 在initServer()的最后，通过aeCreateFileEvent()和aeCreateTimeEvent()函数将fd与相对应的事件通过epoll_ctl()添加到红黑树中，并创建一个就绪链表，aeApiAddEvent()就是redis对epoll_ctl()的封装
+
+   ```c
+   static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
+       aeApiState *state = eventLoop->apidata;
+       struct epoll_event ee = {0}; /* avoid valgrind warning */
+       /* If the fd was already monitored for some event, we need a MOD
+        * operation. Otherwise we need an ADD operation. */
+       int op = eventLoop->events[fd].mask == AE_NONE ?
+               EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+   
+   
+       ee.events = 0;
+       mask |= eventLoop->events[fd].mask; /* Merge old events */
+       if (mask & AE_READABLE) ee.events |= EPOLLIN;
+       if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
+       ee.data.fd = fd;
+       if (epoll_ctl(state->epfd,op,fd,&ee) == -1) return -1;
+       return 0;
+   }
+   ```
+
+6. 回到main()函数，initServer()执行完成后，最后会执行asMain()函数，asMain()内部启动一个while循环执行aeProcessEvent()，aeProcessEvent()内部会调用aeApiPoll()，aeApiPoll()就是redis对epoll_wait()的封装。
+
+   ```c
+   int main(int argc, char **argv) {
+       ......
+       initServer()
+       ......
+       aeMain(server.el);
+       aeDeleteEventLoop(server.el);
+   }
+   
+   
+   void aeMain(aeEventLoop *eventLoop) {
+       eventLoop->stop = 0;
+       while (!eventLoop->stop) {
+           aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                      AE_CALL_BEFORE_SLEEP|
+                                      AE_CALL_AFTER_SLEEP);
+       }
+   }
+   ```
+
+7. 最后来到aeApiPoll()，在这里会调用epoll_wait()，线程会阻塞在这里直到有监听的socket被激活，epoll_wait()仅会返回当前有事件发生的就绪链表
+
+   ```c
+   static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+       aeApiState *state = eventLoop->apidata;
+       int retval, numevents = 0;
+   
+   
+       retval = epoll_wait(state->epfd,state->events,eventLoop->setsize,
+               tvp ? (tvp->tv_sec*1000 + tvp->tv_usec/1000) : -1);
+       if (retval > 0) {
+           int j;
+   
+   
+           numevents = retval;
+           for (j = 0; j < numevents; j++) {
+               int mask = 0;
+               struct epoll_event *e = state->events+j;
+   
+   
+               if (e->events & EPOLLIN) mask |= AE_READABLE;
+               if (e->events & EPOLLOUT) mask |= AE_WRITABLE;
+               if (e->events & EPOLLERR) mask |= AE_WRITABLE|AE_READABLE;
+               if (e->events & EPOLLHUP) mask |= AE_WRITABLE|AE_READABLE;
+               eventLoop->fired[j].fd = e->data.fd;
+               eventLoop->fired[j].mask = mask;
+           }
+       }
+       return numevents;
+   }
+   ```
+
+   ​		至此看完了epoll API在redis源码中的使用，redis整个**main()函数中没有对线程的切换，epoll_wait()返回后的操作也是串行的，在一个请求没完成前是无法执行另一个请求的**，这么看redis其实很容易出现延迟的问题，但是**redis本身都是基于内存的操作，所以即使是串行执行命令的也不会有太大的延迟问题，另外这种单线程的模型也避免了其他可能出现的复杂的并发问题**。
+
