@@ -525,3 +525,11 @@ redis相关的面试题都会有这样几个问题：
 
    ​		至此看完了epoll API在redis源码中的使用，redis整个**main()函数中没有对线程的切换，epoll_wait()返回后的操作也是串行的，在一个请求没完成前是无法执行另一个请求的**，这么看redis其实很容易出现延迟的问题，但是**redis本身都是基于内存的操作，所以即使是串行执行命令的也不会有太大的延迟问题，另外这种单线程的模型也避免了其他可能出现的复杂的并发问题**。
 
+## 6. 其他
+
+- [epoll的惊群效应](https://blog.csdn.net/lyztyycode/article/details/78648798)
+- [彻底理解IO多路复用](https://juejin.im/post/6844904200141438984#heading-5)
+- [Redis中的事件循环](https://draveness.me/redis-eventloop/)
+- [Linux编程之select](https://www.cnblogs.com/skyfsm/p/7079458.html)
+- [IO多路复用与go网络库实现](https://ninokop.github.io/2018/02/18/go-net/)
+
