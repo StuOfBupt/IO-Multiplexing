@@ -351,7 +351,9 @@ redis相关的面试题都会有这样几个问题：
 
    
 
-2. 进到aeCreateEventLoop()方法内部，redis定义了aeEventLoop结构体来保存待处理**文件事件**和**时间事件**，和大量事件执行的上下文信息，aeEventLoop可以参考下这篇文章[Redis中的事件循环](https://draveness.me/redis-eventloop/)，这里需要关注的是`void *apidata`，它被用来存放polling API 相关的数据(刚才说到redis支持epoll/select/evport/kqueue这几种polling API)，下面这张图可以看出aeApiCreate()在不同polling API下有不同的实现，下面我们就进入epoll的aeApiCreate()看看。
+2. 进到aeCreateEventLoop()方法内部，redis定义了aeEventLoop结构体来保存待处理**文件事件**和**时间事件**，和大量事件执行的上下文信息，这里需要关注的是`void *apidata`，它被用来存放polling API 相关的数据(刚才说到redis支持epoll/select/evport/kqueue这几种polling API)。
+
+   > [Redis中的事件循环](https://draveness.me/redis-eventloop/)
 
    ```c
    /* State of an event based program */
