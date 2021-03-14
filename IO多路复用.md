@@ -57,7 +57,12 @@ public class Server {
               	*	接收客户端连接并分配线程处理
               	*/
                 Socket socket = serverSocket.accept();
-                handler(socket);
+                //handler(socket);
+             		new Thread(new Runnable(){
+                  	public void run(){
+                      	handle(socket);
+                    }
+                }).start()
             }
         } catch (IOException e) {
             e.printStackTrace();
